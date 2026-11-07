@@ -1,0 +1,227 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Theme: Semantic Color Tokens ─── */
+
+:root,
+html.dark {
+  --color-bg-base: #050508;
+  --color-bg-surface: rgba(0, 0, 0, 0.4);
+  --color-bg-elevated: #1a1a1a;
+  --color-bg-input: rgba(0, 0, 0, 0.3);
+  --color-bg-hover: rgba(255, 255, 255, 0.05);
+  --color-glass: rgba(255, 255, 255, 0.05);
+  --color-border-default: rgba(255, 255, 255, 0.1);
+  --color-border-subtle: rgba(255, 255, 255, 0.05);
+  --color-text-primary: #ededed;
+  --color-text-secondary: #9ca3af;
+  --color-text-muted: #6b7280;
+  --color-overlay: rgba(0, 0, 0, 0.8);
+  --color-bg-inset: rgba(255, 255, 255, 0.03);
+  --foreground-rgb: 237, 237, 237;
+  --background-start-rgb: 5, 5, 8;
+  --background-end-rgb: 5, 5, 8;
+  --font-inter: 'Inter', sans-serif;
+  --font-jetbrains-mono: 'JetBrains Mono', monospace;
+  --font-space-grotesk: 'Space Grotesk', sans-serif;
+
+  /* ─── Storyboard R2V workbench: status semantic tokens ─── */
+  /* OKLCH base hue + per-role bg/border/fg triplets. Replaces the
+     30+ scattered amber-* / emerald-* / red-* / blue-* tints that
+     used to encode the same 5 states inconsistently. */
+  --color-status-pending-fg:    oklch(0.85 0.13 230);
+  --color-status-pending-border: oklch(0.75 0.16 230 / 0.45);
+  --color-status-pending-bg:    oklch(0.75 0.16 230 / 0.10);
+
+  --color-status-processing-fg:    oklch(0.88 0.16 80);
+  --color-status-processing-border: oklch(0.78 0.18 80 / 0.45);
+  --color-status-processing-bg:    oklch(0.78 0.18 80 / 0.10);
+
+  --color-status-completed-fg:    oklch(0.88 0.16 155);
+  --color-status-completed-border: oklch(0.78 0.18 155 / 0.45);
+  --color-status-completed-bg:    oklch(0.78 0.18 155 / 0.10);
+
+  --color-status-failed-fg:    oklch(0.78 0.20 25);
+  --color-status-failed-border: oklch(0.68 0.21 25 / 0.45);
+  --color-status-failed-bg:    oklch(0.68 0.21 25 / 0.10);
+
+  --color-status-starred-fg:    oklch(0.90 0.15 90);
+  --color-status-starred-border: oklch(0.85 0.16 90 / 0.55);
+  --color-status-starred-bg:    oklch(0.85 0.16 90 / 0.18);
+  --color-status-starred-solid: oklch(0.85 0.16 90);
+
+  /* "On-warm" foreground for text laid over saturated warm chips
+     (amber/gold). Replaces the hard-coded #141416 sprinkled across
+     TaskQueueButton / CompareModal / CandidateThumb / CandidatesSection
+     so the pattern theme-flips. */
+  --color-on-warm: oklch(0.18 0.01 280);
+}
+
+html.light {
+  --color-bg-base: #f8f9fa;
+  --color-bg-surface: #ffffff;
+  --color-bg-elevated: #ffffff;
+  --color-bg-input: #f1f3f5;
+  --color-bg-hover: rgba(0, 0, 0, 0.04);
+  --color-glass: rgba(0, 0, 0, 0.03);
+  --color-border-default: rgba(0, 0, 0, 0.1);
+  --color-border-subtle: rgba(0, 0, 0, 0.06);
+  --color-text-primary: #1a1a1a;
+  --color-text-secondary: #6b7280;
+  --color-text-muted: #9ca3af;
+  --color-overlay: rgba(0, 0, 0, 0.2);
+  --color-bg-inset: rgba(0, 0, 0, 0.02);
+  --foreground-rgb: 26, 26, 26;
+  --background-start-rgb: 248, 249, 250;
+  --background-end-rgb: 248, 249, 250;
+
+  /* Light theme: same hues, slightly higher chroma + darker lightness
+     so chips read with enough weight against a white surface. */
+  --color-status-pending-fg:    oklch(0.45 0.18 230);
+  --color-status-pending-border: oklch(0.65 0.17 230 / 0.50);
+  --color-status-pending-bg:    oklch(0.85 0.10 230 / 0.40);
+
+  --color-status-processing-fg:    oklch(0.50 0.18 80);
+  --color-status-processing-border: oklch(0.65 0.18 80 / 0.50);
+  --color-status-processing-bg:    oklch(0.88 0.10 80 / 0.45);
+
+  --color-status-completed-fg:    oklch(0.45 0.18 155);
+  --color-status-completed-border: oklch(0.62 0.18 155 / 0.50);
+  --color-status-completed-bg:    oklch(0.88 0.10 155 / 0.45);
+
+  --color-status-failed-fg:    oklch(0.45 0.21 25);
+  --color-status-failed-border: oklch(0.60 0.21 25 / 0.55);
+  --color-status-failed-bg:    oklch(0.88 0.10 25 / 0.40);
+
+  --color-status-starred-fg:    oklch(0.45 0.16 80);
+  --color-status-starred-border: oklch(0.65 0.17 85 / 0.60);
+  --color-status-starred-bg:    oklch(0.88 0.12 88 / 0.55);
+  --color-status-starred-solid: oklch(0.75 0.16 88);
+
+  /* Same on-warm token: dark-on-warm-chip works in both themes. */
+  --color-on-warm: oklch(0.20 0.02 280);
+}
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background: linear-gradient(to bottom,
+      transparent,
+      rgb(var(--background-end-rgb))) rgb(var(--background-start-rgb));
+  overflow: hidden;
+  /* Prevent scrolling on the main body, we want an app-like feel */
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .glass-panel {
+    @apply bg-glass backdrop-blur-md border border-glass-border;
+  }
+
+  .glass-input {
+    @apply bg-input-bg backdrop-blur-sm border border-glass-border rounded-md px-3 py-2 focus:outline-none focus:border-primary/50 transition-colors;
+  }
+
+  .glass-button {
+    @apply bg-hover-bg hover:bg-glass backdrop-blur-sm border border-glass-border rounded-md px-4 py-2 transition-all active:scale-95;
+  }
+}
+
+/* Fast tooltip via data-tip attribute — zero extra DOM, ~200ms delay */
+.btn-tip {
+  position: relative;
+}
+.btn-tip::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-default);
+  color: var(--color-text-secondary);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  transition-delay: 0s;
+  z-index: 50;
+}
+.btn-tip:hover::after {
+  opacity: 1;
+  transition-delay: 0.25s;
+}
+
+/* ─── Storyboard R2V workbench keyframes ─── */
+/* Subtle warm pulse for the in-flight count badge in TaskQueueButton.
+   Goal: signal "something's happening over there" without dragging
+   attention away from the user's current shot. */
+@keyframes badgePulse {
+  0%   { box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 0  8px -2px var(--color-status-starred-bg); }
+  50%  { box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 0 14px  0   var(--color-status-starred-border); }
+  100% { box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 0  8px -2px var(--color-status-starred-bg); }
+}
+
+/* CompareModal entry — fade + tiny scale-up. ease-out-quart curve
+   inlined here (Tailwind class would also work but the keyframe
+   keeps everything in one place). */
+@keyframes compareModalIn {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+
+/* TaskQueuePanel slide-in from the right edge when the user opens
+   the queue. Pushes layout (not overlay) so the main column reflows
+   alongside; the keyframe just animates the panel's own entry. */
+@keyframes queuePanelIn {
+  from { opacity: 0; transform: translateX(24px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ShotPanel mount — workbench panels under each shot fade + drop
+   into place when added so users can track the spatial change. */
+@keyframes shotPanelIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* TaskQueuePanel backdrop fade — only renders below xl when the panel
+   becomes an overlay. The backdrop dimming gives the panel its modal
+   register without needing a portal. */
+@keyframes fadeInBackdrop {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* LightboxProvider entrance — backdrop fade + media scale-in.
+   Matches CompareModal's spring feel without the spring physics. */
+@keyframes lightboxFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes lightboxScaleIn {
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* Respect reduced-motion preference: kill all custom animations.
+   The above transitions still apply (CSS transitions on hover etc
+   are kept), but the orchestrated entrance keyframes go away for
+   users who asked for no motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

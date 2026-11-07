@@ -1,0 +1,69 @@
+family: qwen
+display_name: "Qwen Image (通义千问)"
+provider: aliyun
+routing_prefixes:
+  - qwen-image-
+supported_backends:
+  - dashscope
+default_backend: dashscope
+credential_sources:
+  dashscope:
+    - DASHSCOPE_API_KEY
+supported_modalities:
+  - t2i
+  - i2i
+transport:
+  image_input_mode:
+    dashscope: dashscope_multimodal_message
+  audio_input_mode:
+    dashscope: dashscope_temp_file_url
+  reference_video_input_mode:
+    dashscope: dashscope_temp_file_url
+docs:
+  official_snapshot_ids:
+    - aliyun/qwen-image/2026-04-22
+models:
+  - id: qwen-image-2.0-pro
+    display_name: Qwen Image 2.0 Pro
+    description: Advanced image generation with precise text rendering and complex composition
+    status: active
+    release_stage: stable
+    capabilities: [t2i, i2i]
+    docs:
+      context_hub_doc_ids: [aliyun/qwen-image]
+    runtime:
+      dashscope:
+        gateway: dashscope
+        api_model_id: qwen-image-2.0-pro
+    ui:
+      selection_group: image
+      visible_in: [project_settings, series_settings, global_settings]
+      recommended: true
+      order: 100
+      badges: [new]
+    params:
+      negativePrompt: true
+      promptExtend: true
+      watermark: true
+      seed: true
+  - id: qwen-image-2.0
+    display_name: Qwen Image 2.0
+    description: Standard image generation with strong artistic style support
+    status: active
+    release_stage: stable
+    capabilities: [t2i, i2i]
+    docs:
+      context_hub_doc_ids: [aliyun/qwen-image]
+    runtime:
+      dashscope:
+        gateway: dashscope
+        api_model_id: qwen-image-2.0
+    ui:
+      selection_group: image
+      visible_in: [project_settings, series_settings, global_settings]
+      order: 90
+    params:
+      negativePrompt: true
+      promptExtend: true
+      watermark: true
+      seed: true

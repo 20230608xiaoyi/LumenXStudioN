@@ -1,0 +1,269 @@
+family: agnes
+display_name: "Agnes AI"
+provider: agnes
+routing_prefixes:
+  - agnes-
+supported_backends:
+  - agnes
+default_backend: agnes
+credential_sources:
+  agnes:
+    - AGNES_API_KEY
+supported_modalities:
+  - t2i
+  - i2v
+  - t2v
+  - r2v
+transport:
+  image_input_mode:
+    agnes: agnes_image_url
+  audio_input_mode:
+    agnes: agnes_audio_url
+  reference_video_input_mode:
+    agnes: agnes_video_url
+docs:
+  official_snapshot_ids:
+    - agnes/2026-10-17
+models:
+  # 图像：OpenAI images 兼容同步接口
+  - id: agnes-image-2.0-flash
+    display_name: Agnes Image 2.0 Flash
+    description: Agnes AI 快速图像生成（OpenAI images 兼容接口）
+    status: active
+    release_stage: stable
+    capabilities: [t2i]
+    docs:
+      context_hub_doc_ids:
+        - agnes/agnes-image
+    runtime:
+      agnes:
+        gateway: agnes
+    ui:
+      selection_group: image
+      visible_in: [project_settings, series_settings, global_settings]
+      order: 90
+      badges: [new]
+    params:
+      negativePrompt: false
+      seed: false
+  # 图像 2.5 Flash：新一代快速图像生成
+  - id: agnes-image-2.5-flash
+    display_name: Agnes Image 2.5 Flash
+    description: Agnes AI 新一代快速图像生成（OpenAI images 兼容接口）
+    status: active
+    release_stage: stable
+    capabilities: [t2i]
+    docs:
+      context_hub_doc_ids:
+        - agnes/agnes-image
+    runtime:
+      agnes:
+        gateway: agnes
+    ui:
+      selection_group: image
+      visible_in: [project_settings, series_settings, global_settings]
+      order: 91
+      badges: [new]
+    params:
+      negativePrompt: false
+      seed: false
+  # 视频：异步接口（text / keyframe 两种模式）
+  - id: agnes/agnes-video-2.5
+    display_name: Agnes Video 2.5
+    description: Agnes AI 视频生成（文生视频 + 首帧图生视频）
+    status: active
+    release_stage: stable
+    docs:
+      context_hub_doc_ids:
+        - agnes/agnes-video
+    runtime:
+      agnes:
+        gateway: agnes
+    modes:
+      i2v:
+        legacy_id: agnes-video-2.5-i2v
+        display_name: Agnes Video 2.5 I2V
+        description: 首帧图片生成视频（keyframe 模式）
+        capabilities: [i2v]
+        runtime:
+          agnes:
+            gateway: agnes
+        ui:
+          selection_group: i2v
+          visible_in: [project_settings, series_settings, video_sidebar, global_settings]
+          order: 90
+          badges: [new]
+        duration:
+          type: slider
+          min: 4
+          max: 12
+          step: 1
+          default: 5
+        params:
+          resolution:
+            options: [720P, 1080P]
+            default: 1080P
+          aspectRatio:
+            options: ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+            default: "16:9"
+          seed: true
+          watermark: false
+        inputs:
+          reference_images:
+            max: 1
+            reference_type: image
+      t2v:
+        legacy_id: agnes-video-2.5-t2v
+        display_name: Agnes Video 2.5 T2V
+        description: 纯文本生成视频
+        capabilities: [t2v]
+        ui:
+          selection_group: i2v
+          visible_in: []
+        duration:
+          type: slider
+          min: 4
+          max: 12
+          step: 1
+          default: 5
+        params:
+          resolution:
+            options: [720P, 1080P]
+            default: 1080P
+          aspectRatio:
+            options: ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+            default: "16:9"
+          seed: true
+          watermark: false
+      r2v:
+        legacy_id: agnes-video-2.5-r2v
+        display_name: Agnes Video 2.5 R2V
+        description: 多参考图生成视频（reference 模式，参考图≤5）
+        capabilities: [r2v]
+        runtime:
+          agnes:
+            gateway: agnes
+        ui:
+          selection_group: r2v
+          visible_in: [project_settings, series_settings, video_sidebar, global_settings]
+          order: 92
+          badges: [new]
+        duration:
+          type: slider
+          min: 4
+          max: 12
+          step: 1
+          default: 5
+        params:
+          resolution:
+            options: [720P, 1080P]
+            default: 1080P
+          aspectRatio:
+            options: ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+            default: "16:9"
+          seed: true
+          watermark: false
+        inputs:
+          reference_images:
+            max: 5
+            reference_type: image
+  # 视频 2.5 Flash：快速档，分辨率固定 720P（官方文档限制）
+  - id: agnes/agnes-video-2.5-flash
+    display_name: Agnes Video 2.5 Flash
+    description: Agnes AI 快速视频生成（文生视频 + 首帧图生视频，固定 720P）
+    status: active
+    release_stage: stable
+    docs:
+      context_hub_doc_ids:
+        - agnes/agnes-video
+    runtime:
+      agnes:
+        gateway: agnes
+    modes:
+      i2v:
+        legacy_id: agnes-video-2.5-flash-i2v
+        display_name: Agnes Video 2.5 Flash I2V
+        description: 首帧图片生成视频（keyframe 模式，固定 720P）
+        capabilities: [i2v]
+        runtime:
+          agnes:
+            gateway: agnes
+        ui:
+          selection_group: i2v
+          visible_in: [project_settings, series_settings, video_sidebar, global_settings]
+          order: 91
+          badges: [new]
+        duration:
+          type: slider
+          min: 4
+          max: 12
+          step: 1
+          default: 5
+        params:
+          resolution:
+            options: [720P]
+            default: 720P
+          aspectRatio:
+            options: ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+            default: "16:9"
+          seed: true
+          watermark: false
+        inputs:
+          reference_images:
+            max: 1
+            reference_type: image
+      t2v:
+        legacy_id: agnes-video-2.5-flash-t2v
+        display_name: Agnes Video 2.5 Flash T2V
+        description: 纯文本生成视频（固定 720P）
+        capabilities: [t2v]
+        ui:
+          selection_group: i2v
+          visible_in: []
+        duration:
+          type: slider
+          min: 4
+          max: 12
+          step: 1
+          default: 5
+        params:
+          resolution:
+            options: [720P]
+            default: 720P
+          aspectRatio:
+            options: ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+            default: "16:9"
+          seed: true
+          watermark: false
+      r2v:
+        legacy_id: agnes-video-2.5-flash-r2v
+        display_name: Agnes Video 2.5 Flash R2V
+        description: 多参考图生成视频（reference 模式，参考图≤5，固定 720P）
+        capabilities: [r2v]
+        runtime:
+          agnes:
+            gateway: agnes
+        ui:
+          selection_group: r2v
+          visible_in: [project_settings, series_settings, video_sidebar, global_settings]
+          order: 93
+          badges: [new]
+        duration:
+          type: slider
+          min: 4
+          max: 12
+          step: 1
+          default: 5
+        params:
+          resolution:
+            options: [720P]
+            default: 720P
+          aspectRatio:
+            options: ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+            default: "16:9"
+          seed: true
+          watermark: false
+        inputs:
+          reference_images:
+            max: 5
+            reference_type: image

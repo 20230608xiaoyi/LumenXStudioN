@@ -1,0 +1,1693 @@
+import json
+import os
+import time
+import uuid
+import logging
+import traceback
+import re
+from difflib import SequenceMatcher
+from typing import List, Dict, Any, Optional
+
+from .models import Script, Character, Scene, Prop, StoryboardFrame, GenerationStatus
+
+
+def _strip_markdown_json(content: str) -> str:
+    """Strip markdown code fences from LLM JSON output."""
+    if "```json" in content:
+        content = content.split("```json")[1].split("```")[0]
+    elif "```" in content:
+        content = content.split("```")[1].split("```")[0]
+    return content.strip()
+
+
+# ------------------------------------------------------------------
+# R2V 引用标签归一化（与前端 assetRefs.ts 同逻辑）。
+# R2V 提交链只认方括号格式 [characterN:name]，但 LLM 润色时常不守规矩
+# 地输出变体（圆括号包裹、错配括号、@ 前缀、@图N【…】 语法、
+# 冗余同名前缀），导致 reference 解析失败 → 后端 400。在 polish 返回前
+# 统一归一化为唯一合法格式。
+# 名字捕获类排除字符：括号 / 引用符 / 常见标点 / 空白
+_R2V_NAME_CLASS = r"[^（()）\[\]【】@，,。；;：!！?？\s\"'“”‘’]"
+# ① 错配闭括号：椰子[character3:椰子) → 椰子[character3:椰子]
+_R2V_MISMATCH_RE = re.compile(r"\[(character\d+[:：][^\]（）()【】@]{1,30})[)）]")
+# ② 圆括号包裹：木瓜(character2:木瓜) → 木瓜[character2:木瓜]
+# （括号自身就是定界符，名字允许含空格以支持英文角色名，与 TS 版一致）
+_R2V_PAREN_RE = re.compile(r"[（(](character\d+[:：][^（()）\[\]【】@，,。；;：!！?？\"'“”‘’]{1,30})[）)]")
+# ③ @图语法：@图2【角色】椰子（描述…） → [character2:椰子]（描述…）
+_R2V_AT_IMAGE_RE = re.compile(r"@图(\d+)【[^】]*】(" + _R2V_NAME_CLASS + r"{1,30})")
+# ④ 裸 @ 变体：@character3:椰子) → [character3:椰子]
+# （必须带 @：无 @ 的 "characterN:名称" 可能只是英文正文，不归一化）
+_R2V_BARE_RE = re.compile(r"@(character\d+)([:：])\s*(" + _R2V_NAME_CLASS + r"{1,30})[)）]?")
+# ⑤ 冗余同名前缀（inject_reference_tags 注入格式）：木瓜[character2:木瓜] → [character2:木瓜]
+_R2V_REDUNDANT_RE = re.compile(r"(" + _R2V_NAME_CLASS + r"{1,30})\[(character\d+[:：])\1\]")
+
+
+def normalize_r2v_tags(prompt: str) -> str:
+    """把提示词中的变体引用写法归一化为唯一合法的 [characterN:name] 格式。"""
+    if not prompt:
+        return prompt
+    out = _R2V_MISMATCH_RE.sub(r"[\1]", prompt)
+    out = _R2V_PAREN_RE.sub(r"[\1]", out)
+    out = _R2V_AT_IMAGE_RE.sub(r"[character\1:\2]", out)
+
+    def _bare_repl(m: "re.Match") -> str:
+        # 前字符是 "[" 说明已是合法方括号标签，原样保留，避免 [[...]] 双重包裹
+        prev = out[m.start() - 1] if m.start() > 0 else ""
+        if prev == "[":
+            return m.group(0)
+        return f"[{m.group(1)}{m.group(2)}{m.group(3)}]"
+
+    out = _R2V_BARE_RE.sub(_bare_repl, out)
+    out = _R2V_REDUNDANT_RE.sub(r"[\2\1]", out)
+    return out
+
+
+class PolishError(Exception):
+    """提示词润色失败的结构化异常。
+    旧实现遇到任何问题都静默返回原文（fallback），导致前端无法判断
+    "模型真润色完了" 还是 "出错了只是把原文吐回来"。这个异常把失败
+    原因显式抛给上游，让 API 层翻译成 HTTP 502 + 结构化 JSON，
+    前端按 reason 渲染对应错误/警告 UI。
+
+    Reasons:
+      - is_configured_false: LLM 未配置（缺 API key）
+      - api_error: 上游 API 调用本身失败（网络/鉴权/限流/模型不可用）
+      - json_parse_error: 模型返回内容不是合法 JSON
+      - missing_keys: JSON 缺 prompt_cn 或 prompt_en
+      - model_echo: 模型几乎原文返回（warning 级别，不是 hard error，
+        前端展示为黄色警告 + 保留原文双语，让用户追加 feedback 重试）
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        message_zh: str,
+        message_en: str,
+        prompt_cn: str = "",
+        prompt_en: str = "",
+    ):
+        self.reason = reason
+        self.message_zh = message_zh
+        self.message_en = message_en
+        self.prompt_cn = prompt_cn
+        self.prompt_en = prompt_en
+        super().__init__(f"[{reason}] {message_en}")
+
+
+def _is_echo(result_en: str, draft_en: str, threshold: float = 0.95) -> bool:
+    """判断 LLM 输出是否与原文几乎相同（模型未做修改）。
+    threshold 0.95 经验值：低于会误伤"做了轻微改动"的合理结果；
+    高于则放过明显的"换几个标点就交差"。"""
+    a = (result_en or "").strip().lower()
+    b = (draft_en or "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= threshold
+
+
+def _resolve_image_for_vision(url: str) -> Optional[str]:
+    """把任意形式的图像 URL 规整成 vision API 能直接消费的形式。
+      - 已是 http(s):// 或 data:image/ → 原样返回（DashScope 能 fetch / 已内联）
+      - 看起来是相对路径（output/* 或 /files/* 或裸文件名）→ 读本地文件做 base64 data URI
+      - 找不到本地文件 → 返回 None，调用方应跳过这一张
+    DashScope 无法访问 localhost 或私有 OSS 路径，所以本地路径必须 inline。"""
+    import base64
+    if not url or not isinstance(url, str):
+        return None
+    s = url.strip()
+    if not s:
+        return None
+    if s.startswith("http://") or s.startswith("https://") or s.startswith("data:image/"):
+        return s
+    # 规整：'/files/foo/bar.png' → 'foo/bar.png'；'output/foo.png' 原样
+    cleaned = s
+    for prefix in ("/files/outputs/", "/files/output/", "/files/", "files/", "output/"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+            break
+    candidates = [
+        os.path.join("output", cleaned),
+        cleaned,
+    ]
+    abs_path = next((p for p in candidates if os.path.exists(p) and os.path.isfile(p)), None)
+    if not abs_path:
+        return None
+    ext = os.path.splitext(abs_path)[1].lower()
+    mime = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(ext, "image/png")
+    try:
+        with open(abs_path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except OSError:
+        return None
+
+
+from ...utils import get_logger
+
+logger = get_logger(__name__)
+
+# ── Default system prompts for polish/refine stages ──────────────────────
+# These are the built-in defaults. Users can override per-project via PromptConfig.
+# Placeholders: {ASSETS} = asset context, {DRAFT} = draft prompt, {SLOTS} = R2V slot context
+
+DEFAULT_STORYBOARD_POLISH_PROMPT = """
+# ROLE
+You are an expert storyboard artist and prompt engineer. Your task is to rewrite a draft prompt into a high-quality image generation prompt, specifically for a multi-reference image workflow.
+
+# CONTEXT:
+The user has selected specific reference images (assets) to compose a scene.
+You must refer to these assets by their Image ID (e.g., "Image 1", "Image 2") when describing them in the prompt.
+
+# AVAILABLE ASSETS:
+{ASSETS}
+
+# RULES:
+1.  **Integrate Assets**: Explicitly mention "Image X" when describing the corresponding character, scene, or prop.
+2.  **Natural Flow**: Do not just concatenate. Write a coherent sentence or paragraph describing the visual scene.
+3.  **Strict Adherence**: DO NOT hallucinate emotions, actions, or plot details not present in the draft. If the draft says "sitting", do NOT add "sadly" or "happily" unless specified. Keep the narrative neutral and accurate.
+4.  **Enhance Detail**: Add visual details (lighting, atmosphere, emotion) based on the draft prompt, but keep the asset references clear.
+5.  **No Explanations**: Return ONLY the polished prompt text.
+6.  **Bilingual Output**:
+    - **Prompt CN**: Fluent Chinese, strictly following the content of the draft.
+    - **Prompt EN**: Natural English description, prioritizing visual atmosphere.
+
+# OUTPUT FORMAT
+Return STRICTLY a JSON object:
+{{
+    "prompt_cn": "Chinese description with Image X references...",
+    "prompt_en": "English cinematic description with Image X references..."
+}}
+
+# EXAMPLES
+**Input Draft**: Boy (Image 1) sitting on hospital bed (Image 2).
+**Output**:
+{{
+    "prompt_cn": "图像1中的男孩坐在图像2的病床边缘。病房内光线柔和，自然光从侧面照射在男孩身上，勾勒出真实的轮廓。画面构图稳定，质感写实。",
+    "prompt_en": "The boy from Image 1 is seated on the edge of the hospital bed in Image 2. Soft natural light illuminates the scene from the side, highlighting the fabric textures of the bedding and the realistic skin tone of the boy. Cinematic composition, high resolution, photorealistic."
+}}
+
+# USER DRAFT PROMPT
+{DRAFT}
+""".strip()
+
+DEFAULT_VIDEO_POLISH_PROMPT = """You are an expert video prompt engineer. Your task is to optimize a draft prompt for an Image-to-Video generation model.
+
+GUIDELINES:
+1.  **Structure**: Prompt = Motion Description + Camera Movement.
+2.  **Motion Description**: Describe the dynamic action of elements (characters, objects) in the image. Use adjectives to control speed and intensity (e.g., "slowly", "rapidly", "subtle").
+3.  **Camera Movement**: Explicitly state camera moves if needed (e.g., "Zoom in", "Pan left", "Static camera").
+4.  **Clarity**: Be concise but descriptive. Focus on visual movement.
+
+EXAMPLES:
+
+*   **Zoom Out**: "A soft, round animated character with a curious expression wakes up to find their bed is a giant golden corn kernel. Camera zooms out to reveal the room is a massive corn silo, with echoes reverberating, corn kernels piled high like walls, and a beam of warm sunlight streaming from a high window, casting long shadows."
+*   **Pan Left**: "Camera pans left, slowly sweeping across a luxury store window filled with glamorous models and expensive goods. The camera continues panning left, leaving the window to reveal a ragged homeless man shivering in the corner of the adjacent alley."
+
+TASK:
+Rewrite the following draft prompt into a high-quality video generation prompt following the guidelines above.
+
+OUTPUT FORMAT:
+Return STRICTLY a JSON object:
+{{
+    "prompt_cn": "润色后的中文视频提示词，关注运动和镜头",
+    "prompt_en": "Polished English video prompt, focusing on motion and camera"
+}}"""
+
+DEFAULT_R2V_POLISH_PROMPT = """# Role
+You are a prompt engineer for the Wan 2.6 Reference-to-Video model.
+
+# Context
+The R2V (Reference-to-Video) model generates video clips by combining reference character videos with a text prompt.
+The user has uploaded the following reference videos:
+{SLOTS}
+
+The user's input prompt may already contain reference tags written as
+[characterN:name] (e.g. [character1:小兔子]). These tags are the canonical
+way to refer to a slot — characterN is the slot id the model needs, and
+:name is a human-readable label that helps both you and the user keep
+track of which actor each slot represents. The model resolves the slot
+by literal match on "characterN" inside the tag, so the :name suffix
+does not interfere — it just adds visible context.
+
+# Task
+Rewrite the user's input prompt into a structured format strictly following these rules:
+
+1. **PRESERVE [characterN:name] tags exactly as written**. Do NOT strip
+   the brackets, the slot number, or the :name suffix. Whenever you
+   refer to a character that exists in the SLOTS list, write the full
+   tag (e.g. [character1:小兔子]) — never bare "character1" and never
+   the bare name "小兔子" without the tag. If the input has unbracketed
+   character names that match a SLOTS entry, convert them to the full
+   [characterN:name] form on first reference; subsequent references in
+   the same prompt may reuse the full tag.
+   **REUSE the same slot number for every mention of the same actor.**
+   The slot number is fixed per actor by the SLOTS list above —
+   [character1:小兔子] referenced three times stays [character1:小兔子]
+   all three times. Do NOT invent new slot numbers like [character3:小兔子]
+   for an actor that already has a slot. Each slot maps 1:1 to a
+   reference image, so adding a new slot would break the model's
+   expectation of how many references it has.
+   The ONLY valid tag format is the square-bracket form [characterN:name].
+   These variants are all WRONG and must NEVER appear in your output:
+   木瓜(character2:木瓜)、椰子[character3:椰子)、@character2:木瓜、
+   @图2【角色】木瓜 — if you catch yourself writing any of them,
+   rewrite it as the bracket form [characterN:name].
+2. **STRUCTURE**: Use this format:
+   - Scene setup (environment, lighting, mood)
+   - Character action (what [characterN:name] is doing, their expressions, movements)
+   - Camera movement (if applicable)
+3. **DIALOGUE FORMAT**: If the prompt includes dialogue, format it as:
+   '[character1:name] says: "dialogue content"'
+4. **PRESERVE INTENT**: Keep the original intent and emotional tone.
+5. **ENHANCE**: Add visual details for dramatic effect (lighting, speed descriptors like "slowly", "rapidly").
+
+# Output Format
+Return STRICTLY a JSON object:
+{{
+    "prompt_cn": "润色后的中文提示词，保留 [characterN:name] 完整标签",
+    "prompt_en": "Polished English prompt, preserving [characterN:name] tags verbatim"
+}}
+
+# Examples
+
+INPUT: 主角从门里跳出来说话
+SLOTS: character1 = "White rabbit / 小兔子", character2 = "Robot dog / 机械狗"
+OUTPUT:
+{{
+    "prompt_cn": "[character1:小兔子] 从门里猛然跳出，落地时耳朵竖起，充满活力。房间昏暗，温暖的光线从尘土飞扬的窗户中透入。[character1:小兔子] 兴奋地环顾四周说道：'我正好赶上了！' 镜头随着跳跃略微倾斜。",
+    "prompt_en": "[character1:White rabbit] bursts through the door with an exaggerated jump, landing energetically with ears perked up. The room is dimly lit with warm ambient light streaming through dusty windows. [character1:White rabbit] looks around excitedly and says: 'I made it just in time!' Camera follows the jump with a slight tilt."
+}}""".strip()
+
+
+class ScriptProcessor:
+    def __init__(self, api_key: str = None):
+        self._api_key = api_key
+        from .llm_adapter import LLMAdapter
+        self.llm = LLMAdapter()
+
+    @property
+    def is_configured(self):
+        return self.llm.is_configured
+
+    def parse_novel(self, title: str, text: str) -> Script:
+        """
+        Parses the raw novel text into a structured Script object using an LLM.
+        """
+        logger.info(f"Parsing novel: {title}...")
+        
+        if not self.is_configured:
+             logger.error("LLM API key not configured.")
+             raise ValueError("LLM API Key 未配置。请在 API 配置中设置对应的 API Key 后重试。")
+
+        prompt = self._construct_prompt(text)
+
+        try:
+            content = self.llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+            )
+            logger.debug(f"LLM Response Content:\n{content}")
+
+            content = _strip_markdown_json(content)
+            data = json.loads(content)
+            return self._create_script_from_data(title, text, data)
+                
+        except json.JSONDecodeError as e:
+            error_msg = f"LLM 返回的数据格式错误，无法解析 JSON: {e}"
+            logger.error(error_msg, exc_info=True)
+            raise RuntimeError(error_msg)
+        except ValueError:
+            # Re-raise ValueError (e.g., API key not set)
+            raise
+        except Exception as e:
+            error_msg = f"剧本解析失败: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            raise RuntimeError(error_msg)
+
+    def _create_script_from_data(self, title: str, original_text: str, data: Dict[str, Any]) -> Script:
+        script_id = str(uuid.uuid4())
+        
+        characters = []
+        name_to_char = {} # For variant linking
+        llm_id_to_uuid = {} # For ID resolution
+
+        # Pass 1: Create all characters
+        for char_data in data.get("characters", []):
+            char_uuid = str(uuid.uuid4())
+            llm_id = char_data.get("id")
+            if llm_id:
+                llm_id_to_uuid[llm_id] = char_uuid
+            
+            char = Character(
+                id=char_uuid,
+                name=char_data.get("name", "Unknown"),
+                description=char_data.get("description", ""),
+                age=char_data.get("age"),
+                gender=char_data.get("gender"),
+                clothing=char_data.get("clothing"), # Might be merged into description in new prompt, but keeping for compatibility
+                visual_weight=char_data.get("visual_weight", 3),
+                status=GenerationStatus.PENDING
+            )
+            characters.append(char)
+            name_to_char[char.name] = char
+            
+        # Pass 2: Link variants to base characters (Logic remains valid even with new prompt if naming convention holds)
+        for char in characters:
+            if "(" in char.name and ")" in char.name:
+                base_name = char.name.split("(")[0].strip()
+                if base_name in name_to_char and name_to_char[base_name].id != char.id:
+                    char.base_character_id = name_to_char[base_name].id
+            
+        scenes = []
+        for scene_data in data.get("scenes", []):
+            scene_uuid = str(uuid.uuid4())
+            llm_id = scene_data.get("id")
+            if llm_id:
+                llm_id_to_uuid[llm_id] = scene_uuid
+
+            scenes.append(Scene(
+                id=scene_uuid,
+                name=scene_data.get("name", "Unknown"),
+                description=scene_data.get("description", ""),
+                time_of_day=scene_data.get("time_of_day"),
+                lighting_mood=scene_data.get("lighting_mood"),
+                visual_weight=scene_data.get("visual_weight", 3),
+                status=GenerationStatus.PENDING
+            ))
+            
+        props = []
+        for prop_data in data.get("props", []):
+            prop_uuid = str(uuid.uuid4())
+            llm_id = prop_data.get("id")
+            if llm_id:
+                llm_id_to_uuid[llm_id] = prop_uuid
+
+            props.append(Prop(
+                id=prop_uuid,
+                name=prop_data.get("name", "Unknown"),
+                description=prop_data.get("description", ""),
+                status=GenerationStatus.PENDING
+            ))
+            
+        frames = []
+        for frame_data in data.get("frames", []):
+            # Resolve Character IDs
+            char_ids = []
+            for cid in frame_data.get("character_ids", []):
+                if cid in llm_id_to_uuid:
+                    char_ids.append(llm_id_to_uuid[cid])
+            
+            # Resolve Prop IDs
+            prop_ids = []
+            for pid in frame_data.get("prop_ids", []):
+                if pid in llm_id_to_uuid:
+                    prop_ids.append(llm_id_to_uuid[pid])
+
+            # Resolve Scene ID
+            scene_llm_id = frame_data.get("scene_id")
+            scene_id = llm_id_to_uuid.get(scene_llm_id)
+            if not scene_id and scenes:
+                scene_id = scenes[0].id # Fallback
+            elif not scene_id:
+                scene_id = str(uuid.uuid4()) # Fallback if no scenes
+
+            # Handle Dialogue
+            dialogue_data = frame_data.get("dialogue")
+            dialogue_text = None
+            speaker_name = None
+            if isinstance(dialogue_data, dict):
+                dialogue_text = dialogue_data.get("text")
+                speaker_name = dialogue_data.get("speaker")
+            elif isinstance(dialogue_data, str):
+                dialogue_text = dialogue_data # Fallback for old format
+
+            frames.append(StoryboardFrame(
+                id=str(uuid.uuid4()),
+                scene_id=scene_id,
+                character_ids=char_ids,
+                prop_ids=prop_ids,
+                action_description=frame_data.get("action_description", ""),
+                facial_expression=frame_data.get("facial_expression"),
+                dialogue=dialogue_text,
+                speaker=speaker_name,
+                camera_angle=frame_data.get("camera_angle", "Medium Shot"),
+                camera_movement=frame_data.get("camera_movement"),
+                composition=frame_data.get("composition"),
+                atmosphere=frame_data.get("atmosphere"),
+                image_prompt=f"{frame_data.get('action_description')} {frame_data.get('facial_expression', '')} {frame_data.get('camera_angle')} {frame_data.get('lighting_mood', '')} {frame_data.get('atmosphere', '')}", 
+                status=GenerationStatus.PENDING
+            ))
+            
+        return Script(
+            id=script_id,
+            title=title,
+            original_text=original_text,
+            characters=characters,
+            scenes=scenes,
+            props=props,
+            frames=frames,
+            created_at=time.time(),
+            updated_at=time.time()
+        )
+
+    def create_draft_script(self, title: str, text: str) -> Script:
+        """
+        Creates a draft script object without LLM analysis.
+        """
+        return Script(
+            id=str(uuid.uuid4()),
+            title=title,
+            original_text=text,
+            characters=[],
+            scenes=[],
+            props=[],
+            frames=[],
+            created_at=time.time(),
+            updated_at=time.time()
+        )
+
+    def split_into_episodes(self, text: str, suggested_episodes: int = 3) -> List[Dict[str, Any]]:
+        """
+        Uses LLM to split a long text into episodes by narrative rhythm.
+        Returns a list of episode dicts with title, summary, start/end markers, etc.
+        """
+        if not self.is_configured:
+            raise ValueError("LLM API Key 未配置。请在 API 配置中设置对应的 API Key 后重试。")
+
+        MAX_TEXT_LENGTH = 80000
+        if len(text) > MAX_TEXT_LENGTH:
+            text = text[:MAX_TEXT_LENGTH] + "\n\n[文本已截断，请基于已有内容进行划分]"
+
+        prompt = f"""你是一名专业的剧本编剧和分集策划师。
+
+请将以下小说/剧本文本按叙事节奏划分为约 {suggested_episodes} 集。
+
+划分原则：
+1. 每集应有完整的叙事弧（开端/发展/高潮或悬念）
+2. 在自然的情节转折点或场景切换处分集
+3. 各集内容量大致均衡，但优先保证叙事完整性
+4. 实际集数可以在建议集数 ±2 范围内浮动
+
+输出纯 JSON（不要 markdown 代码块）:
+{{
+  "episodes": [
+    {{
+      "episode_number": 1,
+      "title": "集标题",
+      "summary": "50字以内的内容摘要",
+      "start_marker": "该集起始的原文前20字",
+      "end_marker": "该集结束的原文后20字",
+      "estimated_duration": "预估时长（分钟）"
+    }}
+  ]
+}}
+
+原文如下：
+
+{text}"""
+
+        try:
+            content = self.llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = _strip_markdown_json(content)
+            data = json.loads(content)
+            episodes = data.get("episodes", [])
+            if not episodes:
+                raise RuntimeError("LLM 未返回任何分集数据")
+            return episodes
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"LLM 返回的分集数据格式错误: {e}")
+        except ValueError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"分集划分失败: {str(e)}")
+
+    def _mock_parse(self, title: str, text: str) -> Script:
+        # ... (Existing mock logic moved here) ...
+        script_id = str(uuid.uuid4())
+        
+        # Mock Characters
+        char1 = Character(
+            id=str(uuid.uuid4()),
+            name="Alex",
+            description="A young adventurer with messy brown hair and a determined look.",
+            age="20",
+            gender="Male",
+            clothing="Leather jacket, jeans",
+            visual_weight=5,
+            status=GenerationStatus.PENDING
+        )
+        char2 = Character(
+            id=str(uuid.uuid4()),
+            name="Luna",
+            description="A mysterious mage with silver hair and glowing blue eyes.",
+            age="Unknown",
+            gender="Female",
+            clothing="Dark robe with silver embroidery",
+            visual_weight=4,
+            status=GenerationStatus.PENDING
+        )
+        
+        # Mock Scene
+        scene1 = Scene(
+            id=str(uuid.uuid4()),
+            name="Ancient Ruins",
+            description="Crumbling stone walls covered in moss, illuminated by shafts of sunlight breaking through the canopy.",
+            visual_weight=3,
+            status=GenerationStatus.PENDING
+        )
+        
+        # Mock Props
+        prop1 = Prop(
+            id=str(uuid.uuid4()),
+            name="Glowing Crystal",
+            description="A jagged crystal pulsing with a faint purple light.",
+            status=GenerationStatus.PENDING
+        )
+        
+        # Mock Frames
+        frames = []
+        
+        # Frame 1
+        frames.append(StoryboardFrame(
+            id=str(uuid.uuid4()),
+            scene_id=scene1.id,
+            character_ids=[char1.id],
+            action_description="Alex steps cautiously into the ruins, looking around.",
+            camera_angle="Wide Shot",
+            camera_movement="Pan Left",
+            image_prompt="Wide shot of Alex stepping into ancient ruins, mossy stone walls, sunlight beams, cinematic lighting, pan left.",
+            status=GenerationStatus.PENDING
+        ))
+        
+        # Frame 2
+        frames.append(StoryboardFrame(
+            id=str(uuid.uuid4()),
+            scene_id=scene1.id,
+            character_ids=[char1.id, char2.id],
+            action_description="Luna appears from the shadows, surprising Alex.",
+            dialogue="Luna: You shouldn't be here.",
+            camera_angle="Medium Shot",
+            camera_movement="Static",
+            image_prompt="Medium shot of Luna emerging from shadows behind Alex, mysterious atmosphere, static camera.",
+            status=GenerationStatus.PENDING
+        ))
+        
+        # Frame 3
+        frames.append(StoryboardFrame(
+            id=str(uuid.uuid4()),
+            scene_id=scene1.id,
+            character_ids=[char2.id],
+            prop_ids=[prop1.id],
+            action_description="Luna holds up the glowing crystal.",
+            camera_angle="Close Up",
+            camera_movement="Zoom In",
+            image_prompt="Close up of Luna holding a glowing purple crystal, magical effects, zoom in.",
+            status=GenerationStatus.PENDING
+        ))
+        
+        script = Script(
+            id=script_id,
+            title=title,
+            original_text=text,
+            characters=[char1, char2],
+            scenes=[scene1],
+            props=[prop1],
+            frames=frames,
+            created_at=time.time(),
+            updated_at=time.time()
+        )
+        
+        return script
+
+    def _construct_prompt(self, text: str) -> str:
+        """
+        Prompt A: Entity Extractor
+        Constructs the system prompt for extracting characters, scenes, and props ONLY.
+        Frames are generated separately via analyze_to_storyboard (Prompt B).
+        """
+        return f"""
+        You are a professional storyboard artist and scriptwriter.
+        Analyze the following novel text and extract structured data for a comic/video production.
+        
+        IMPORTANT: 
+        - All descriptive content (names, descriptions) MUST be in CHINESE (Simplified Chinese).
+        - Extract ONLY characters, scenes, and props.
+        
+        Output strictly in valid JSON format with the following structure:
+        {{
+            "characters": [
+                {{
+                    "id": "char_001",
+                    "name": "Character Name (e.g. '叶墨', '叶墨 (古装)')",
+                    "description": "Visual description (hair, eyes, build, distinct features). DO NOT include specific facial expressions (e.g. sad, angry) or temporary actions (e.g. running, crying). Focus on permanent physical traits.",
+                    "age": "Age estimate (e.g. '25')",
+                    "gender": "Gender",
+                    "clothing": "Default outfit description. If a character changes outfits significantly (e.g. from casual to wedding dress), create a separate character entry for each outfit variant with a distinct name (e.g. 'Name (Outfit)').",
+                    "visual_weight": 5  // 1-5 importance
+                }}
+            ],
+            "scenes": [
+                {{
+                    "id": "scene_001",
+                    "name": "Location Name (e.g. '咖啡店', '古代遗迹')",
+                    "description": "Visual description (lighting, mood, key elements)",
+                    "visual_weight": 3
+                }}
+            ],
+            "props": [
+                {{
+                    "id": "prop_001",
+                    "name": "Prop Name",
+                    "description": "Visual description"
+                }}
+            ]
+        }}
+
+        Text:
+        {text}
+        """
+
+    def analyze_script_for_styles(self, script_text: str) -> List[Dict[str, Any]]:
+        """使用 LLM 分析剧本并推荐视觉风格"""
+        
+        logger.info("Analyzing script for visual style recommendations...")
+        
+        if not self.is_configured:
+            logger.warning("DASHSCOPE_API_KEY not set. Returning default recommendations.")
+            return self._mock_style_recommendations()
+        
+        system_prompt = """你是一个专业的电影美术指导和视觉风格顾问。
+请根据提供的剧本内容，分析其题材、情绪和氛围，推荐3种截然不同但都适合的视觉风格。
+
+对于每种风格，请提供：
+1. 风格名称（简洁、专业，使用英文）
+2. 风格描述（1-2句话，用中文）
+3. 推荐理由（为什么这个风格适合这个剧本，用中文，50字以内）
+4. Stable Diffusion 正向提示词（详细的风格关键词，英文，逗号分隔，不超过50个词）
+5. Stable Diffusion 负向提示词（避免的视觉元素，英文，逗号分隔，不超过30个词）
+
+IMPORTANT: 
+- 你的回复必须是严格的JSON格式。
+- 不要包含任何解释性文字。
+- 所有文本中的引号必须使用转义符号 (例如 \")。
+- 确保JSON完整，不要被截断。
+- 保持内容精炼，避免过长的描述。
+- 严禁重复生成相同的内容，不要陷入循环。
+- 只返回3个推荐风格，不要多也不要少。
+
+CRITICAL STYLE GUIDELINES:
+- 正向提示词必须只描述：光影、色调、材质、艺术媒介、氛围、镜头语言 (e.g., "cinematic lighting, film grain, watercolor texture, dark atmosphere").
+- 严禁描述具体实体：不要包含人物、服装、具体物品、环境细节 (e.g., 禁止 "cracked helmet", "blood stains", "monster", "forest", "sword").
+- 风格必须是通用的，能套用到任何角色或场景上，而不会改变其原本的物理结构。
+
+返回格式：
+{
+  "recommendations": [
+    {
+      "name": "风格名称",
+      "description": "风格描述",
+      "reason": "推荐理由",
+      "positive_prompt": "正向提示词",
+      "negative_prompt": "负向提示词"
+    }
+  ]
+}"""
+
+        user_prompt = f"剧本内容：\n\n{script_text[:2000]}"  # 限制长度避免 token 限制
+        
+        try:
+            content = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={'type': 'json_object'},
+            )
+            logger.debug(f"Style Analysis Response:\n{content}")
+
+            # Clean up markdown code blocks if present
+            content = _strip_markdown_json(content)
+
+            # Safety check: if content is suspiciously long, truncate it
+            # This prevents issues where the model gets stuck in a loop
+            if len(content) > 5000:
+                logger.warning(f"Response too long ({len(content)} chars), truncating...")
+                content = content[:5000]
+                # Find the last closing brace of a recommendation object to make truncation cleaner
+                last_brace = content.rfind("}")
+                if last_brace != -1:
+                    content = content[:last_brace+1]
+
+            def repair_json(json_str):
+                """Attempt to repair truncated or malformed JSON."""
+                json_str = json_str.strip()
+
+                # If truncated, try to close it
+                if not json_str.endswith("}"):
+                    # Count open braces/brackets
+                    open_braces = json_str.count("{") - json_str.count("}")
+                    open_brackets = json_str.count("[") - json_str.count("]")
+                    open_quotes = json_str.count('"') % 2
+
+                    if open_quotes:
+                        json_str += '"'
+
+                    json_str += "]" * open_brackets
+                    json_str += "}" * open_braces
+
+                # Ensure the root object is closed
+                if json_str.count("{") > json_str.count("}"):
+                     json_str += "}" * (json_str.count("{") - json_str.count("}"))
+
+                return json_str
+
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parsing error: {e}")
+                logger.error(f"Raw content length: {len(content)}")
+
+                # Try to fix common JSON issues
+                try:
+                    # 1. Attempt to extract JSON object from text using regex
+                    import re
+                    # Look for the outermost JSON object
+                    json_match = re.search(r'\{[\s\S]*\}', content)
+                    if json_match:
+                        content = json_match.group(0)
+
+                    # 2. Try to repair if it looks truncated
+                    content = repair_json(content)
+
+                    data = json.loads(content)
+                except Exception as inner_e:
+                    logger.error(f"Failed to recover JSON: {inner_e}")
+                    # Last resort: try to parse partially using regex for fields
+                    try:
+                        logger.debug("Attempting regex extraction of fields...")
+                        recommendations = []
+                        # Regex to find style objects - improved to be non-greedy and handle newlines
+                        style_matches = re.finditer(r'\{\s*"name":\s*"(.*?)",\s*"description":\s*"(.*?)".*?\}', content, re.DOTALL)
+
+                        # If that fails, try a simpler regex that just looks for the array items
+                        if not list(style_matches):
+                            # Fallback manual parsing
+                            pass
+
+                        if not recommendations:
+                            # Construct a basic valid JSON if we have at least some content
+                            if "recommendations" in content:
+                                # Try to close it forcefully
+                                fixed_content = content + "}]}"
+                                try:
+                                    data = json.loads(fixed_content)
+                                    recommendations = data.get("recommendations", [])
+                                except:
+                                    pass
+
+                        if not recommendations:
+                            raise ValueError("Regex extraction failed")
+                    except:
+                        return self._mock_style_recommendations()
+
+            recommendations = data.get("recommendations", [])
+
+            # Add unique IDs
+            for i, rec in enumerate(recommendations):
+                rec["id"] = f"ai-rec-{i+1}-{str(uuid.uuid4())[:8]}"
+                rec["is_custom"] = False
+
+            return recommendations
+
+        except Exception as e:
+            logger.error(f"Error analyzing script for styles: {e}", exc_info=True)
+            return self._mock_style_recommendations()
+    
+    def _mock_style_recommendations(self) -> List[Dict[str, Any]]:
+        """返回默认的风格推荐"""
+        return [
+            {
+                "id": f"mock-cinematic-{str(uuid.uuid4())[:8]}",
+                "name": "Cinematic Realism",
+                "description": "电影级写实风格，专业打光",
+                "reason": "适合大多数叙事性内容，提供专业的视觉质感",
+                "positive_prompt": "cinematic, photorealistic, 8k, volumetric lighting, film grain, dramatic lighting",
+                "negative_prompt": "cartoon, anime, low quality, blurry",
+                "is_custom": False
+            },
+            {
+                "id": f"mock-anime-{str(uuid.uuid4())[:8]}",
+                "name": "Anime Style",
+                "description": "日式动漫风格，明快色彩",
+                "reason": "适合充满情感表现的故事",
+                "positive_prompt": "anime style, cel shading, vibrant colors, expressive, detailed character design",
+                "negative_prompt": "photorealistic, 3d, blurry, washed out",
+                "is_custom": False
+            },
+            {
+                "id": f"mock-noir-{str(uuid.uuid4())[:8]}",
+                "name": "Film Noir",
+                "description": "黑色电影风格，高对比度",
+                "reason": "适合悬疑、神秘题材的叙事",
+                "positive_prompt": "black and white, film noir, high contrast, dramatic shadows, moody lighting",
+                "negative_prompt": "colorful, bright, happy, modern",
+                "is_custom": False
+            }
+        ]
+    
+    def analyze_to_storyboard(self, text: str, entities_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Analyzes script text and generates storyboard frames using Prompt B (Storyboard Director).
+        Returns a list of frame dictionaries with visual atoms.
+        """
+        logger.info(f"Analyzing text to storyboard: {text[:100]}...")
+        
+        if not self.is_configured:
+            logger.warning("DASHSCOPE_API_KEY not set. Returning mock frames.")
+            return self._mock_storyboard_frames(text)
+        
+        # Build entities context
+        characters_list = entities_json.get("characters", [])
+        scenes_list = entities_json.get("scenes", [])
+        props_list = entities_json.get("props", [])
+
+        entities_str = json.dumps({
+            "characters": characters_list,
+            "scenes": scenes_list,
+            "props": props_list,
+        }, ensure_ascii=False, indent=2)
+
+        system_prompt = f"""# 角色
+你是一名电影级的分镜师。你的任务是将剧本文本拆解为一系列连续的分镜帧。
+
+# 核心规则
+1. **视觉节拍拆解**: 一行包含多个动作时，拆为多帧。每帧仅含一个主要动作。
+2. **角色可见性**: character_ref_names 只列画面中可见的角色。
+3. **实体约束**: 场景名、角色名、道具名严格匹配已提取实体。
+4. **语言**: 简体中文。
+5. **景别枚举**: 必须从以下选项中选择: 大特写 | 特写 | 近景 | 中景 | 全景 | 远景 | 大远景
+6. **角度枚举**: 必须从以下选项中选择: 平视 | 俯视 | 仰视 | 鸟瞰 | 蚁视 | 过肩 | 荷兰角 | 主观视角
+7. **时长**: 基于动作复杂度估算整数秒（范围 3-10 秒）。简单静态 3-4s，标准动作 5-6s，复杂/情绪镜头 7-10s。
+8. **对白**: 如果帧中有角色说话，dialogue 和 speaker 必须填写。一帧只能有一个说话人——多人对话必须拆为多帧。
+
+# 剧本格式说明
+- **场景标题行**: `1-1 地点名称 [时间] [内/外]`
+- **人物行**: `人物：角色名1，角色名2`
+- **动作描述**: 以 `△` 开头
+- **对话**: `角色名（情绪）：对话内容`，或 `角色名 (V.O.)：` 表示画外音
+
+# 已提取的实体
+{entities_str}
+
+# 输出格式
+返回 JSON 对象 {{"frames": [...]}}。不要包含 Markdown 标记。
+
+每帧字段:
+{{
+    "scene_ref_name": "场景名",
+    "character_ref_names": ["角色名"],
+    "prop_ref_names": ["道具名"],
+    "action_summary": "一句话概括这帧发生什么（含角色动作 + 物理事件 + 神态表情）",
+    "shot_size": "中景",
+    "camera_angle": "平视",
+    "camera_movement": "静止",
+    "dialogue": "台词内容（无对白则为 null）",
+    "speaker": "说话人（无对白则为 null）",
+    "duration": 5
+}}
+
+# 示例
+{{
+    "frames": [
+        {{
+            "scene_ref_name": "卧室",
+            "character_ref_names": ["叶墨"],
+            "prop_ref_names": ["手机"],
+            "action_summary": "手机在床头柜上震动，叶墨烦躁翻身，眉头紧锁，被子滑落",
+            "shot_size": "中景",
+            "camera_angle": "俯视",
+            "camera_movement": "静止",
+            "dialogue": "妈，这才几点啊！",
+            "speaker": "叶墨",
+            "duration": 4
+        }},
+        {{
+            "scene_ref_name": "卧室",
+            "character_ref_names": ["叶墨"],
+            "prop_ref_names": ["手机"],
+            "action_summary": "叶墨看到来电显示，猛地坐起，表情惊恐",
+            "shot_size": "特写",
+            "camera_angle": "平视",
+            "camera_movement": "快速推镜",
+            "dialogue": "已经来了？",
+            "speaker": "叶墨",
+            "duration": 3
+        }}
+    ]
+}}
+
+# 剧本内容
+{text}
+"""
+
+        try:
+            content = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": "请开始生成分镜帧列表，确保覆盖剧本中的所有内容。"}
+                ],
+            ).strip()
+            logger.debug(f"Storyboard Analysis Raw Response: {content[:500]}...")
+
+            frames = self._parse_storyboard_json(content)
+            if frames is not None:
+                return frames
+
+            # First parse failed — retry once with response_format constraint
+            logger.warning("Storyboard JSON parse failed, retrying with response_format=json_object...")
+            retry_content = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": "请开始生成分镜帧列表，确保覆盖剧本中的所有内容。请务必输出合法的JSON格式。"}
+                ],
+                response_format={'type': 'json_object'},
+            ).strip()
+            logger.debug(f"Storyboard Analysis Retry Response: {retry_content[:500]}...")
+            frames = self._parse_storyboard_json(retry_content)
+            if frames is not None:
+                return frames
+
+            raise RuntimeError(
+                "AI 模型输出的 JSON 格式不合规，自动重试后仍然失败。请重新点击生成按钮再试一次。"
+            )
+
+        except RuntimeError:
+            raise  # Re-raise our own descriptive errors
+        except Exception as e:
+            logger.error(f"Error in storyboard analysis: {e}", exc_info=True)
+            raise RuntimeError(f"分镜分析过程出错: {str(e)}")
+    
+    def _parse_storyboard_json(self, content: str):
+        """Try to parse storyboard JSON from LLM output. Returns frames list or None on failure."""
+        content = _strip_markdown_json(content)
+
+        try:
+            result = json.loads(content.strip())
+            frames = result.get("frames", [])
+            if not frames:
+                logger.warning("Parsed JSON successfully but 'frames' array is empty")
+                return None
+            logger.info(f"Storyboard Analysis generated {len(frames)} frames")
+            return frames
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse storyboard analysis JSON: {e}")
+            return None
+
+    def _mock_storyboard_frames(self, text: str) -> List[Dict[str, Any]]:
+        """Returns mock storyboard frames for testing when API is unavailable."""
+        return [
+            {
+                "scene_ref_name": "卧室",
+                "character_ref_names": ["叶墨"],
+                "prop_ref_names": ["手机"],
+                "visual_atmosphere": "昏暗的卧室，窗外透进冷色调月光",
+                "character_acting": "叶墨眉头紧锁，眼神迷离",
+                "key_action_physics": "手机在柜上剧烈震动",
+                "shot_size": "中景",
+                "camera_angle": "平视",
+                "camera_movement": "Static",
+                "dialogue": None,
+                "speaker": None
+            }
+        ]
+
+    def refine_frame_to_rich(
+        self,
+        coarse_frame: Dict[str, Any],
+        character_assets: List[Dict[str, Any]],
+        scene_assets: List[Dict[str, Any]],
+        prev_frame_context: Optional[str] = None,
+        next_frame_context: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Phase 2: Refine a coarse frame into a rich frame with full structured fields."""
+        if not self.is_configured:
+            logger.warning("LLM not configured, cannot refine frame")
+            return None
+
+        system_prompt = f"""# Role
+You are a film storyboard refinement specialist. Enrich one coarse frame into full structured data + visual description.
+
+# Input Context
+- Coarse frame info (scene, characters, action, shot_size, angle, duration)
+- Character assets (appearance, clothing)
+- Scene assets (environment, atmosphere)
+- Adjacent frames for continuity
+
+# Output
+Return a JSON object with ALL fields below. null is acceptable for optional fields.
+
+{{
+    "visual_description": "Complete visual description (100-200 chars). Describe environment, character acting, physical action, lighting.",
+    "shot_size": "One of: 大特写|特写|近景|中景|全景|远景|大远景",
+    "camera_angle": "One of: 平视|俯视|仰视|鸟瞰|蚁视|过肩|荷兰角|主观视角",
+    "camera_movement": {{
+        "primary": "static|push_in|pull_out|pan_left|pan_right|tilt_up|tilt_down|orbit|follow|crane_up|crane_down|handheld|zoom_in|zoom_out",
+        "secondary": null,
+        "speed": "slow|normal|fast",
+        "description": "Natural language description of camera motion"
+    }},
+    "blocking": {{
+        "description": "Spatial layout description: left->right: CharA(depth) | CharB(depth)",
+        "stage": [
+            {{
+                "ref": "character/prop name",
+                "zone": "left|center|right (combinable: left-top, center-bottom)",
+                "depth": "fore|mid|back",
+                "height": "ground|low|surface|eye|high|overhead",
+                "facing": "toward-camera|away|left|right|profile-left|profile-right",
+                "posture": "standing|sitting|lying|crouching|dynamic"
+            }}
+        ],
+        "camera_relation": "eye-level|elevated|low-angle|behind-subject|over-shoulder"
+    }},
+    "dialogue_structured": {{
+        "speaker": "speaker name",
+        "line": "dialogue text",
+        "emotion": "emotion tag",
+        "delivery": "delivery style (volume, speed, tone)"
+    }},
+    "audio_note": {{
+        "sfx": "sound effect description",
+        "ambience": "ambient sound",
+        "bgm_note": "BGM change note or null"
+    }},
+    "lighting": {{
+        "direction": "light source direction (left-above/right/top/back/front)",
+        "quality": "soft|hard",
+        "color_temp": "warm|neutral|cool",
+        "description": "Natural language lighting description"
+    }},
+    "transition_hint": "Cut type to next frame (硬切|叠化|黑场|匹配剪辑) or null",
+    "duration": 5
+}}
+
+# Rules
+1. visual_description must be fluent Chinese, covering environment + performance + action + lighting feel.
+2. dialogue_structured is null if this frame has no dialogue.
+3. audio_note can be null.
+4. blocking.stage should cover all visible characters and key props.
+5. Maintain continuity with adjacent frames.
+6. camera_movement has at most primary + secondary.
+
+# Coarse Frame
+{json.dumps(coarse_frame, ensure_ascii=False, indent=2)}
+
+# Character Assets
+{json.dumps(character_assets, ensure_ascii=False, indent=2)}
+
+# Scene Assets
+{json.dumps(scene_assets, ensure_ascii=False, indent=2)}
+
+# Previous Frame Context
+{prev_frame_context or "None (this is the first frame)"}
+
+# Next Frame Context
+{next_frame_context or "None (this is the last frame)"}
+"""
+        try:
+            content = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": "Please refine this frame. Output valid JSON only, no markdown fences."}
+                ],
+                response_format={'type': 'json_object'},
+            ).strip()
+            content = _strip_markdown_json(content)
+            result = json.loads(content)
+            return result
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse frame refine JSON: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Frame refine LLM call failed: {e}")
+            return None
+
+    def polish_storyboard_prompt(self, draft_prompt: str, assets: List[Dict[str, Any]], feedback: str = "", custom_system_prompt: str = "") -> Dict[str, str]:
+        """
+        Polishes the storyboard prompt using Qwen-Plus, incorporating asset references.
+        Returns a dict with 'prompt_cn' and 'prompt_en'.
+        """
+        logger.debug(f"Polishing prompt: {draft_prompt}")
+
+        fallback_result = {"prompt_cn": draft_prompt, "prompt_en": draft_prompt}
+
+        if not self.is_configured:
+             return fallback_result
+
+        # Construct context about assets
+        asset_context = []
+        for i, asset in enumerate(assets):
+            asset_type = asset.get('type', 'Unknown')
+            name = asset.get('name', 'Unknown')
+            desc = asset.get('description', '')
+            # Map index to "Image X"
+            asset_context.append(f"Image {i+1}: {asset_type} - {name} ({desc})")
+
+        context_str = "\n".join(asset_context)
+
+        # Use custom prompt or default, substituting placeholders
+        template = custom_system_prompt.strip() if custom_system_prompt and custom_system_prompt.strip() else DEFAULT_STORYBOARD_POLISH_PROMPT
+        system_prompt = template.replace("{ASSETS}", context_str).replace("{DRAFT}", draft_prompt)
+
+        # Build user message with optional feedback (injected in user content, not system prompt)
+        user_content = system_prompt
+        if feedback and feedback.strip():
+            user_content += f"""
+[用户反馈]
+{feedback.strip()}
+
+请根据用户反馈修改提示词，只修改用户指出的问题，保持其他部分不变。
+"""
+
+        try:
+            content = self.llm.chat(
+                messages=[{"role": "user", "content": user_content}],
+                response_format={'type': 'json_object'},
+            ).strip()
+            logger.debug(f"Polished Prompt Raw: {content}")
+
+            # Parse JSON response
+            content = _strip_markdown_json(content)
+
+            try:
+                result = json.loads(content.strip())
+                if "prompt_cn" in result and "prompt_en" in result:
+                    logger.debug(f"Polished Prompt CN: {result['prompt_cn'][:100]}...")
+                    logger.debug(f"Polished Prompt EN: {result['prompt_en'][:100]}...")
+                    return result
+                else:
+                    logger.warning("LLM response missing prompt_cn or prompt_en")
+                    return fallback_result
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse polish response JSON: {e}")
+                return fallback_result
+                
+        except Exception as e:
+            logger.error(f"Error polishing prompt: {e}", exc_info=True)
+            return fallback_result
+    def polish_video_prompt(
+        self,
+        draft_prompt: str,
+        feedback: str = "",
+        custom_system_prompt: str = "",
+        prev_cn: str = "",
+        image_urls: Optional[List[str]] = None,
+        polish_model: str = "",
+    ) -> Dict[str, str]:
+        """
+        Polishes a video generation prompt using Qwen.
+        Returns bilingual prompts {prompt_cn, prompt_en}.
+
+        迭代时（feedback 非空）支持传入 prev_cn 实现双语锚点：
+          - 首次 polish: draft_prompt = 用户原文，prev_cn 留空
+          - 迭代 polish: draft_prompt = 上次的 EN，prev_cn = 上次的 CN，
+            feedback = 用户中文反馈。模型同时看到双语版，用 CN 锚点
+            定位反馈意图，再同步修改双语，降低 drift。
+
+        image_urls: I2V 模式下传入 active first frame URL（让 vision-capable
+        模型真正"看见"图像，比纯文本润色质量大幅提升）。空列表/None = 走
+        纯文本路径（兼容老的 t2i polish 或无 frame 的 shot）。
+
+        polish_model: 显式覆盖 LLMAdapter 默认模型；空 = 用 system default。
+
+        Raises:
+            PolishError: 4 种失败原因，由 API 层翻译成 HTTP 502。
+        """
+        if not self.is_configured:
+            raise PolishError(
+                reason="is_configured_false",
+                message_zh="LLM 未配置（缺少 DASHSCOPE_API_KEY），请到设置中检查。",
+                message_en="LLM not configured (missing DASHSCOPE_API_KEY). Please check settings.",
+            )
+
+        has_images = bool(image_urls)
+        system_prompt = (
+            custom_system_prompt.strip()
+            if custom_system_prompt and custom_system_prompt.strip()
+            else DEFAULT_VIDEO_POLISH_PROMPT
+        )
+        # 让模型知道有图可看（仅在多模态分支才追加，避免无图时误导）。
+        if has_images:
+            system_prompt = (
+                system_prompt
+                + "\n\nIMPORTANT: The user has attached the first frame image(s) of the clip. "
+                "Look at the image(s) to ground your polish — describe what is actually visible "
+                "(subjects, composition, lighting, color palette) and use that to enrich the "
+                "motion/camera description. Do NOT invent elements absent from the image."
+            )
+
+        # Build user TEXT message — 首次 vs 迭代不同形态
+        if feedback and feedback.strip():
+            if prev_cn and prev_cn.strip():
+                user_text = f"""[当前提示词-CN]
+{prev_cn.strip()}
+
+[当前提示词-EN]
+{draft_prompt}
+
+[用户反馈]
+{feedback.strip()}
+
+请根据用户反馈同步修改双语版本，只修改用户指出的问题，保持其他部分不变。"""
+            else:
+                # 向后兼容：旧调用方未带 prev_cn 时仍可工作
+                user_text = f"""[当前提示词]
+{draft_prompt}
+
+[用户反馈]
+{feedback.strip()}
+
+请根据用户反馈修改提示词，只修改用户指出的问题，保持其他部分不变。"""
+        else:
+            user_text = draft_prompt
+
+        user_content: Any = user_text
+        if has_images:
+            # Multimodal user message — Qwen-VL & Kimi-K2 vision API
+            # follow OpenAI's chat-completions multimodal schema. We
+            # always put images FIRST so the model attends to them
+            # before reading the text-side instructions.
+            parts: List[Dict[str, Any]] = []
+            for url in image_urls:
+                resolved = _resolve_image_for_vision(url)
+                if resolved:
+                    parts.append({"type": "image_url", "image_url": {"url": resolved}})
+            if not parts:
+                # All image URLs failed to resolve → fall back to text-only
+                # rather than crashing. log so users can diagnose later.
+                logger.warning("polish: image_urls provided but none resolved; falling back to text-only")
+                has_images = False
+            else:
+                parts.append({"type": "text", "text": user_text})
+                user_content = parts
+
+        try:
+            content = self.llm.chat(
+                messages=[
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_content},
+                ],
+                model=polish_model or None,
+                response_format={'type': 'json_object'},
+            ).strip()
+        except Exception as e:
+            logger.exception("Video polish: LLM API error")
+            raise PolishError(
+                reason="api_error",
+                message_zh=f"模型调用失败：{e}",
+                message_en=f"Model call failed: {e}",
+            ) from e
+        logger.debug(f"Video Prompt Polish Raw: {content[:200]}...")
+
+        content = _strip_markdown_json(content)
+        try:
+            result = json.loads(content.strip())
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse video polish JSON: {e}")
+            raise PolishError(
+                reason="json_parse_error",
+                message_zh="模型返回了无效响应，建议重试或简化提示词。",
+                message_en="Model returned invalid response. Try again or simplify the prompt.",
+            ) from e
+
+        if "prompt_cn" not in result or "prompt_en" not in result:
+            logger.warning("Video polish missing bilingual keys")
+            raise PolishError(
+                reason="missing_keys",
+                message_zh="模型返回了不完整的双语结果，建议重试。",
+                message_en="Model returned incomplete bilingual result. Please retry.",
+            )
+
+        # Echo 检测：模型几乎原文返回。本质是 warning（带原文给前端），
+        # 不是 hard error；前端按黄色警告渲染，让用户补 feedback。
+        if _is_echo(result["prompt_en"], draft_prompt):
+            raise PolishError(
+                reason="model_echo",
+                message_zh="模型未做明显修改。建议在下方反馈框补充具体要求（如运镜、光影、情绪）后重试。",
+                message_en="Model made no notable changes. Add more specific feedback (camera, lighting, mood) and retry.",
+                prompt_cn=result["prompt_cn"],
+                prompt_en=result["prompt_en"],
+            )
+
+        return result
+
+    # ==================================================================
+    # AI 剧本大纲：创意 → 多集大纲 → 逐集剧本扩写
+    # ==================================================================
+
+    OUTLINE_SYSTEM_PROMPT = """你是一位资深短剧策划。用户会给出一个创意（题材/梗概/风格），\
+你需要规划出一部多集短剧的完整大纲。
+
+要求：
+1. 每集 2-4 分钟短剧体量，剧情紧凑有钩子，集尾留悬念。
+2. 每集梗概必须包含「人物、场景、冲突、悬念钩子」四要素。
+3. 角色/地点/道具一律使用具体命名（如"阿澈""七号废品站""星尘玻璃球"），禁止"某人""某地"等泛称。
+4. 人物关系与主线前后连贯，每集聚焦一个明确冲突。
+5. 严格输出 JSON，不要输出任何其他文字。格式：
+{"series_title": "剧名", "logline": "一句话故事", "episodes": [
+  {"episode_number": 1, "title": "本集标题", "synopsis": "本集完整剧情概要（200-400字，包含开场/冲突/反转/钩子）", "cliffhanger": "本集结尾悬念"}
+]}"""
+
+    def generate_outline(
+        self,
+        idea: str,
+        episode_count: int = 8,
+        genre: str = "",
+        model: str = "",
+    ) -> Dict[str, Any]:
+        """创意 → 多集大纲 JSON。
+
+        Returns:
+            {"series_title", "logline", "episodes": [{episode_number, title, synopsis, cliffhanger}]}
+
+        Raises:
+            PolishError: 未配置 / API 错误 / JSON 解析失败。
+        """
+        if not self.is_configured:
+            raise PolishError(
+                reason="is_configured_false",
+                message_zh="LLM 未配置（缺少 DASHSCOPE_API_KEY），请到设置中检查。",
+                message_en="LLM not configured (missing DASHSCOPE_API_KEY). Please check settings.",
+            )
+        user_text = (
+            f"创意：{idea.strip()}\n"
+            f"集数：{max(1, min(60, int(episode_count)))} 集\n"
+            + (f"题材/风格：{genre.strip()}\n" if genre and genre.strip() else "")
+            + "\n请生成完整多集大纲。"
+        )
+        try:
+            content = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": self.OUTLINE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+                model=model or None,
+                response_format={"type": "json_object"},
+            ).strip()
+        except Exception as e:
+            logger.exception("outline: LLM API error")
+            raise PolishError(
+                reason="api_error",
+                message_zh=f"模型调用失败：{e}",
+                message_en=f"Model call failed: {e}",
+            ) from e
+        try:
+            data = json.loads(_strip_markdown_json(content))
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse outline JSON: {e}")
+            raise PolishError(
+                reason="json_parse_error",
+                message_zh="模型返回了无效的大纲 JSON，建议重试。",
+                message_en="Model returned invalid outline JSON. Please retry.",
+            ) from e
+        if not isinstance(data.get("episodes"), list) or not data["episodes"]:
+            raise PolishError(
+                reason="missing_keys",
+                message_zh="模型未返回有效的大纲集数，建议重试。",
+                message_en="Model returned no episodes. Please retry.",
+            )
+        return data
+
+    def expand_outline_to_script(
+        self,
+        series_title: str,
+        logline: str,
+        episode_number: int,
+        episode_title: str,
+        episode_synopsis: str,
+        previous_summary: str = "",
+        model: str = "",
+    ) -> str:
+        """大纲条目 → 可直接 parse_novel 的完整单集剧本文本。
+
+        输出格式为叙事式剧本（场景 + 动作 + 对白），与 parse_novel 的
+        小说文本输入兼容，后续直接走既有实体提取/分镜流水线。
+        """
+        if not self.is_configured:
+            raise PolishError(
+                reason="is_configured_false",
+                message_zh="LLM 未配置（缺少 DASHSCOPE_API_KEY），请到设置中检查。",
+                message_en="LLM not configured (missing DASHSCOPE_API_KEY). Please check settings.",
+            )
+        system_prompt = """你是一位短剧编剧。请根据大纲把该集扩写成完整剧本（叙事体，非分镜表）。
+
+要求：
+1. 纯文本叙事体：场景描述、人物动作、角色对白（对白用「角色名：台词」格式，每句一行）。
+2. 1500-3000 字，节奏紧凑，开场 10 秒内进入冲突，结尾落在悬念上。
+3. 不要输出场景编号、不要输出分镜术语（景别/运镜）、不要输出旁白标记。
+4. 直接输出剧本正文，不要标题、不要解释。"""
+        user_text = (
+            f"剧名：{series_title}\n"
+            + (f"故事一句话：{logline}\n" if logline else "")
+            + (f"前情提要：{previous_summary}\n" if previous_summary else "")
+            + f"本集（第 {episode_number} 集）标题：{episode_title}\n"
+            + f"本集剧情概要：{episode_synopsis}\n\n请扩写完整剧本。"
+        )
+        try:
+            content = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                model=model or None,
+            ).strip()
+        except Exception as e:
+            logger.exception("expand_outline: LLM API error")
+            raise PolishError(
+                reason="api_error",
+                message_zh=f"模型调用失败：{e}",
+                message_en=f"Model call failed: {e}",
+            ) from e
+        if not content:
+            raise PolishError(
+                reason="json_parse_error",
+                message_zh="模型返回了空剧本，建议重试。",
+                message_en="Model returned empty script. Please retry.",
+            )
+        return content
+
+    def correct_subtitles(
+        self,
+        srt_text: str,
+        script_text: str = "",
+        model: str = "",
+    ) -> str:
+        """whisper 识别结果 AI 纠错：对照剧本台词修正错别字/同音字。
+
+        保持 SRT 时间轴与块结构不变，仅修改文本内容。
+        """
+        if not self.is_configured:
+            raise PolishError(
+                reason="is_configured_false",
+                message_zh="LLM 未配置（缺少 DASHSCOPE_API_KEY），请到设置中检查。",
+                message_en="LLM not configured (missing DASHSCOPE_API_KEY). Please check settings.",
+            )
+        system_prompt = """你是字幕校对员。用户会给出 whisper 语音识别生成的 SRT 字幕（可能有同音字/错别字/漏字），\
+以及可选的剧本文本作为参照。
+
+规则：
+1. 只修正明显的识别错误（错别字、同音字、明显漏字），不要改写句子风格。
+2. SRT 的时间轴行（00:00:00,000 --> 00:00:00,000）和序号结构必须原样保留，一字不动。
+3. 块数、每块的时间轴必须与输入完全一致，只允许修改字幕文本行。
+4. 直接输出修正后的完整 SRT，不要任何解释或代码块标记。"""
+        user_text = (
+            (f"[剧本文本参照]\n{script_text[:6000]}\n\n" if script_text and script_text.strip() else "")
+            + f"[SRT 字幕]\n{srt_text}"
+        )
+        try:
+            content = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                model=model or None,
+            ).strip()
+        except Exception as e:
+            logger.exception("correct_subtitles: LLM API error")
+            raise PolishError(
+                reason="api_error",
+                message_zh=f"模型调用失败：{e}",
+                message_en=f"Model call failed: {e}",
+            ) from e
+        content = content.strip()
+        if content.startswith("```"):
+            content = _strip_markdown_json(content)
+        # 基本校验：块数必须一致，否则视为模型破坏了结构
+        def _srt_blocks(s: str) -> int:
+            import re as _re
+            return len(_re.findall(r"^\d+\s*$", s, flags=_re.MULTILINE))
+        if _srt_blocks(content) != _srt_blocks(srt_text):
+            logger.warning("correct_subtitles: block count mismatch, keeping original")
+            raise PolishError(
+                reason="model_echo",
+                message_zh="纠错结果与原字幕结构不一致，已保留原文。可关闭 AI 纠错或重试。",
+                message_en="Corrected SRT structure mismatch; original kept. Disable AI correction or retry.",
+            )
+        return content
+
+    def polish_r2v_prompt(
+        self,
+        draft_prompt: str,
+        slots: List[Dict[str, str]],
+        feedback: str = "",
+        custom_system_prompt: str = "",
+        prev_cn: str = "",
+        image_urls: Optional[List[str]] = None,
+        polish_model: str = "",
+    ) -> Dict[str, str]:
+        """
+        Polishes a R2V (Reference-to-Video) prompt using Qwen.
+        R2V requires explicit character references using character1, character2, character3 tags.
+        Returns bilingual prompts {prompt_cn, prompt_en}.
+
+        prev_cn: 双语锚点迭代用。详见 polish_video_prompt 文档。
+        image_urls: R2V 模式下传入用户挂载的 reference image URLs，让 vision
+        模型看见 character1/2/3 实际长什么样，再写出符合形象的运镜描述。
+        polish_model: 显式覆盖 LLMAdapter 默认模型；空 = 用 system default。
+
+        Raises:
+            PolishError: 4 种失败原因，由 API 层翻译成 HTTP 502。
+        """
+        if not self.is_configured:
+            raise PolishError(
+                reason="is_configured_false",
+                message_zh="LLM 未配置（缺少 DASHSCOPE_API_KEY），请到设置中检查。",
+                message_en="LLM not configured (missing DASHSCOPE_API_KEY). Please check settings.",
+            )
+
+        has_images = bool(image_urls)
+
+        # Build slot context - using character1/2/3 format
+        slot_context = []
+        for i, slot in enumerate(slots):
+            char_id = f"character{i + 1}"
+            slot_context.append(f"- {char_id}: {slot['description']}")
+        slot_context_str = "\n".join(slot_context) if slot_context else "No reference videos provided."
+
+        # Use custom prompt or default, substituting {SLOTS} placeholder
+        template = (
+            custom_system_prompt.strip()
+            if custom_system_prompt and custom_system_prompt.strip()
+            else DEFAULT_R2V_POLISH_PROMPT
+        )
+        system_prompt = template.replace("{SLOTS}", slot_context_str)
+        if has_images:
+            system_prompt = (
+                system_prompt
+                + "\n\nIMPORTANT: The user has attached the reference image(s) for character1/2/3 above. "
+                "Look at the images to understand each character's actual appearance, costume, and pose. "
+                "Use that grounding when writing the action / camera description so the polished prompt "
+                "is faithful to what the references show. Do NOT contradict visible details."
+            )
+
+        if feedback and feedback.strip():
+            if prev_cn and prev_cn.strip():
+                user_text = f"""[当前提示词-CN]
+{prev_cn.strip()}
+
+[当前提示词-EN]
+{draft_prompt}
+
+[用户反馈]
+{feedback.strip()}
+
+请根据用户反馈同步修改双语版本，只修改用户指出的问题，保持其他部分不变。"""
+            else:
+                user_text = f"""[当前提示词]
+{draft_prompt}
+
+[用户反馈]
+{feedback.strip()}
+
+请根据用户反馈修改提示词，只修改用户指出的问题，保持其他部分不变。"""
+        else:
+            user_text = draft_prompt
+
+        user_content: Any = user_text
+        if has_images:
+            parts: List[Dict[str, Any]] = []
+            for url in image_urls:
+                resolved = _resolve_image_for_vision(url)
+                if resolved:
+                    parts.append({"type": "image_url", "image_url": {"url": resolved}})
+            if not parts:
+                # All image URLs failed to resolve → fall back to text-only
+                # rather than crashing. log so users can diagnose later.
+                logger.warning("polish: image_urls provided but none resolved; falling back to text-only")
+                has_images = False
+            else:
+                parts.append({"type": "text", "text": user_text})
+                user_content = parts
+
+        try:
+            content = self.llm.chat(
+                messages=[
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_content},
+                ],
+                model=polish_model or None,
+                response_format={'type': 'json_object'},
+            ).strip()
+        except Exception as e:
+            logger.exception("R2V polish: LLM API error")
+            raise PolishError(
+                reason="api_error",
+                message_zh=f"模型调用失败：{e}",
+                message_en=f"Model call failed: {e}",
+            ) from e
+        logger.debug(f"R2V Polished Raw: {content[:200]}...")
+
+        content = _strip_markdown_json(content)
+        try:
+            result = json.loads(content.strip())
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse R2V polish JSON: {e}")
+            raise PolishError(
+                reason="json_parse_error",
+                message_zh="模型返回了无效响应，建议重试或简化提示词。",
+                message_en="Model returned invalid response. Try again or simplify the prompt.",
+            ) from e
+
+        if "prompt_cn" not in result or "prompt_en" not in result:
+            logger.warning("R2V polish missing bilingual keys")
+            raise PolishError(
+                reason="missing_keys",
+                message_zh="模型返回了不完整的双语结果，建议重试。",
+                message_en="Model returned incomplete bilingual result. Please retry.",
+            )
+
+        # 源头治理：LLM 偶尔会把 [characterN:name] 写成变体（圆括号 / 错配
+        # 括号 / @ 前缀 / @图语法），前端 R2V 提交链只认方括号格式，
+        # 变体会导致 reference 解析失败 → 提交 400。返回前统一归一化。
+        result["prompt_cn"] = normalize_r2v_tags(result["prompt_cn"])
+        result["prompt_en"] = normalize_r2v_tags(result["prompt_en"])
+
+        if _is_echo(result["prompt_en"], draft_prompt):
+            raise PolishError(
+                reason="model_echo",
+                message_zh="模型未做明显修改。建议在下方反馈框补充具体要求（如运镜、光影、情绪）后重试。",
+                message_en="Model made no notable changes. Add more specific feedback (camera, lighting, mood) and retry.",
+                prompt_cn=result["prompt_cn"],
+                prompt_en=result["prompt_en"],
+            )
+
+        return result
